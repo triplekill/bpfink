@@ -40,6 +40,15 @@ var (
 	ErrReload = fmt.Errorf("reload consumer")
 )
 
+const (
+	writeEvent  = 1
+	renameEvent = 2
+	dirCreate   = 3
+	fileCreate  = 4
+	delFile     = -1
+	delDir      = -2
+)
+
 //NewWatcher function to create new watcher function
 func NewWatcher(options ...func(*Watcher)) *Watcher {
 	watcher := &Watcher{Logger: zerolog.Nop(), consumers: Consumers{zerolog.Nop(), &sync.Map{}}, CloseChannels: make(chan struct{}, 1)}
@@ -84,7 +93,7 @@ func (c Consumers) Files() (files []string) {
 }
 
 func (w *Watcher) add(file string, consumer Consumer) {
-	switch err := w.Add(file); {
+	switch err := w.AddFile(file); {
 	case err == nil:
 		w.consumers.Store(file, consumer)
 		w.Debug().Str("file", file).Msgf("start watching")
@@ -101,7 +110,41 @@ func (w *Watcher) add(file string, consumer Consumer) {
 }
 
 func (w *Watcher) remove(file string) {
-	if err := w.Remove(file); err != nil {
+	if err := w.RemoveFile(file); err != nil {
+		w.Error().Err(err).Str("file", file).Msg("failed to remove consumer")
+		w.consumers.Delete(file)
+	}
+}
+
+func (w *Watcher) addInode(event Event) {
+	file, err := w.GetFileFromInode(event.Inode)
+	if err != nil {
+		w.Debug().Msg("set to genaric file consumer")
+		return
+	}
+
+	consumer, err := w.consumers.get(file)
+	if err != nil {
+		w.Debug().Msg("set to genaric consumer")
+	}
+	switch err := w.AddInode(event.Device, event.Path); {
+	case err == nil:
+		w.consumers.Store(event.Path, consumer)
+		w.Debug().Str("file", event.Path).Msgf("start watching")
+	case IsNotExist(err):
+		w.Debug().Str("file", event.Path).
+			Msgf("file does not exist polling filesystem")
+		w.consumers.Store(event.Path, NewFileMissing(w.Events, func(fm *FileMissing) {
+			fm.Logger, fm.File, fm.Consumer = w.Logger, event.Path, consumer
+		}))
+	default:
+		w.Error().Str("file", event.Path).AnErr("error", err).
+			Msg("failed to add to watch list")
+	}
+}
+
+func (w *Watcher) removeInode(key uint64) {
+	if file, err := w.RemoveInode(key); err != nil {
 		w.Error().Err(err).Str("file", file).Msg("failed to remove consumer")
 		w.consumers.Delete(file)
 	}
@@ -140,6 +183,16 @@ func (w *Watcher) Start() error {
 		select {
 		case event := <-w.Events:
 			w.Debug().Object("event", LogEvent(event)).Msg("event caught")
+			switch event.Mode {
+			case dirCreate:
+				w.addInode(event)
+			case fileCreate:
+				w.addInode(event)
+			case delFile:
+				w.removeInode(event.Inode)
+			case delDir:
+				w.removeInode(event.Inode)
+			}
 			consumer, err := w.consumers.get(event.Path)
 			if err != nil {
 				if consumer == nil {
@@ -192,11 +245,15 @@ func (w *Watcher) Start() error {
 				}
 
 				if err != ErrReload && event.Mode == 2 { //Rename event, reload consumer file, without consumer needed to worry about event types
-					err = w.Remove(event.Path)
+					err = w.RemoveFile(event.Path)
 					if err != nil {
 						w.Error().Err(err)
 					}
 					w.add(event.Path, consumer)
+				}
+				if err != ErrReload && event.Mode == 3 {
+					w.Debug().Msg("Unlink Event, updating file inodes")
+					w.remove((event.Path))
 				}
 			}(consumer, event)
 		case <-w.CloseChannels:
